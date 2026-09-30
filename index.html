@@ -1,0 +1,408 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>공룡 게임 (Dino Runner)</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { height: 100%; }
+  body {
+    background: #f7f7f7;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    font-family: 'Consolas', 'Courier New', monospace;
+    overflow: hidden; user-select: none; touch-action: manipulation;
+  }
+  #wrap { width: 100%; max-width: 900px; position: relative; }
+  canvas { width: 100%; height: auto; display: block; touch-action: none; }
+  #hint {
+    position: absolute; left: 0; right: 0; bottom: 6%;
+    text-align: center; color: #535353; font-size: 14px; pointer-events: none;
+  }
+  #duck-btn {
+    position: fixed; right: 18px; bottom: 20px; z-index: 5;
+    width: 84px; height: 84px; border-radius: 50%;
+    border: 2px solid #9a9a9a; background: rgba(0,0,0,.06);
+    color: #535353; font: bold 15px 'Consolas', monospace;
+    display: none; touch-action: none;
+  }
+  @media (pointer: coarse) { #duck-btn { display: block; } }
+  #topbar { position: fixed; top: 12px; right: 16px; z-index: 5; display: flex; gap: 8px; }
+  #topbar button {
+    padding: 8px 12px; border-radius: 8px; border: 2px solid #9a9a9a;
+    background: rgba(255,255,255,.85); color: #535353;
+    font: bold 13px 'Consolas', monospace; cursor: pointer;
+  }
+</style>
+</head>
+<body>
+  <div id="wrap"><canvas id="game"></canvas><div id="hint">탭 / 스페이스 = 점프 · 아래 = 숙이기</div></div>
+  <div id="topbar">
+    <button id="rotate-btn">⟳ 화면 회전</button>
+    <button id="restart-btn">↻ 다시 시작</button>
+  </div>
+  <button id="duck-btn">숙이기</button>
+
+<script>
+(() => {
+  // ── 화면 설정 (내부 해상도 800x250, 선명하게 2배 스케일) ──
+  const VW = 800, VH = 250;
+  const canvas = document.getElementById('game');
+  const ctx = canvas.getContext('2d');
+  const DPR = 2;
+  canvas.width = VW * DPR;
+  canvas.height = VH * DPR;
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  ctx.imageSmoothingEnabled = false;
+
+  // ── 상태 ──
+  const GROUND_Y = 200;
+  let state = 'ready';           // ready | running | over
+  let speed = 380;               // px/sec
+  let distance = 0;
+  let score = 0;
+  let highScore = Number(localStorage.getItem('dinoHighScore') || 0);
+  let obstacles = [];
+  let clouds = [];
+  let stars = [];
+  let spawnTimer = 0;
+  let nextSpawn = 0.9;
+  let flashTimer = 0;
+  let night = false;
+  let groundOffset = 0;
+  let lastTime = 0;
+  let worldTime = 0;
+
+  function reset() {
+    state = 'running';
+    speed = 380; distance = 0; score = 0; obstacles = []; clouds = [];
+    spawnTimer = 0; nextSpawn = 0.9; flashTimer = 0; night = false;
+    groundOffset = 0; worldTime = 0;
+    dino.reset();
+    for (let i = 0; i < 4; i++) spawnCloud(Math.random() * VW);
+    stars = [];
+    for (let i = 0; i < 12; i++) stars.push({ x: Math.random() * VW, y: 20 + Math.random() * 90, r: Math.random() * 1.2 + 0.6 });
+  }
+
+  // ── 사운드 (WebAudio) ──
+  let audioCtx = null;
+  function beep(freq, dur, type = 'square', vol = 0.06) {
+    try {
+      if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+      const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+      o.type = type; o.frequency.value = freq;
+      g.gain.setValueAtTime(vol, audioCtx.currentTime);
+      g.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + dur);
+      o.connect(g).connect(audioCtx.destination);
+      o.start(); o.stop(audioCtx.currentTime + dur);
+    } catch (e) {}
+  }
+
+  // ── 공룡 ──
+  const dino = {
+    x: 60, y: GROUND_Y, vy: 0, w: 44, h: 47,
+    ducking: false, duckW: 60, duckH: 30,
+    onGround: true, runFrame: 0, duckFrame: 0, reset() {
+      this.y = GROUND_Y; this.vy = 0; this.ducking = false;
+      this.onGround = true; this.runFrame = 0; this.duckFrame = 0;
+    },
+    jump() {
+      if (this.onGround) { this.vy = -720; this.onGround = false; beep(620, 0.09, 'square'); }
+    },
+    setDuck(v) { this.ducking = v && this.onGround; },
+    update(dt) {
+      this.vy += 2300 * dt;
+      this.y += this.vy * dt;
+      if (this.y >= GROUND_Y) { this.y = GROUND_Y; this.vy = 0; this.onGround = true; }
+      this.runFrame += dt * 12;
+      this.duckFrame += dt * 12;
+    },
+    rect() {
+      if (this.ducking) return { x: this.x, y: this.y - this.duckH, w: this.duckW, h: this.duckH };
+      return { x: this.x, y: this.y - this.h, w: this.w, h: this.h };
+    }
+  };
+
+  // ── 장애물 ──
+  function spawnObstacle() {
+    const canBird = score > 200;
+    const r = Math.random();
+    if (canBird && r < 0.28) {
+      const heights = [GROUND_Y - 90, GROUND_Y - 62, GROUND_Y - 36];
+      obstacles.push({
+        type: 'bird', x: VW + 30,
+        y: heights[Math.floor(Math.random() * 3)],
+        w: 46, h: 34, frame: 0
+      });
+    } else {
+      const big = Math.random() < 0.5;
+      const sizes = big
+        ? [{ w: 25, h: 52 }, { w: 50, h: 52 }]
+        : [{ w: 17, h: 36 }, { w: 34, h: 36 }];
+      const s = sizes[Math.floor(Math.random() * sizes.length)];
+      obstacles.push({ type: 'cactus', x: VW + 30, y: GROUND_Y - s.h, w: s.w, h: s.h, frame: 0 });
+    }
+  }
+
+  function spawnCloud(x) { clouds.push({ x, y: 25 + Math.random() * 70, s: 0.7 + Math.random() * 0.6 }); }
+
+  // ── 충돌 (여유 있게 판정) ──
+  function hits(a, b) {
+    const pad = 4;
+    return a.x + pad < b.x + b.w - pad && a.x + a.w - pad > b.x + pad &&
+           a.y + pad < b.y + b.h - pad && a.y + a.h - pad > b.y + pad;
+  }
+
+  // ── 업데이트 ──
+  function update(dt) {
+    worldTime += dt;
+    flashTimer = Math.max(0, flashTimer - dt);
+
+    if (state === 'ready') { dino.runFrame += dt * 6; return; }
+    if (state === 'over') return;
+
+    // 난이도 상승
+    speed = Math.min(1000, 380 + distance * 0.02);
+    distance += speed * dt;
+
+    const prevScore = score;
+    score = Math.floor(distance / 10);
+    if (score > 0 && Math.floor(score / 100) > Math.floor(prevScore / 100)) {
+      beep(1046, 0.12, 'square'); flashTimer = 0.5;
+    }
+    if (score > highScore) { highScore = score; localStorage.setItem('dinoHighScore', String(highScore)); }
+
+    // 낮/밤
+    night = Math.floor(score / 700) % 2 === 1;
+
+    groundOffset = (groundOffset + speed * dt) % 40;
+
+    dino.update(dt);
+
+    // 장애물 생성
+    spawnTimer += dt;
+    if (spawnTimer >= nextSpawn) {
+      spawnTimer = 0;
+      spawnObstacle();
+      const gap = Math.max(0.55, 1.25 - distance / 40000);
+      nextSpawn = gap + Math.random() * 0.5;
+    }
+
+    // 장애물 이동/충돌
+    const dRect = dino.rect();
+    for (const o of obstacles) {
+      o.x -= speed * dt;
+      o.frame += dt * 10;
+      if (hits(dRect, o)) { gameOver(); return; }
+    }
+    obstacles = obstacles.filter(o => o.x + o.w > -20);
+
+    // 구름
+    for (const c of clouds) c.x -= speed * 0.35 * dt;
+    clouds = clouds.filter(c => c.x > -60);
+    if (clouds.length < 4 && Math.random() < dt * 0.4) spawnCloud(VW + 40);
+  }
+
+  let overAt = 0;
+  function gameOver() {
+    state = 'over';
+    overAt = performance.now();
+    beep(160, 0.35, 'sawtooth', 0.08);
+    if (score > highScore) { highScore = score; localStorage.setItem('dinoHighScore', String(highScore)); }
+  }
+
+  // ── 그리기 ──
+  function px(x, y, w, h, color) { ctx.fillStyle = color; ctx.fillRect(x, y, w, h); }
+
+  function drawDino() {
+    const fg = night ? '#f7f7f7' : '#535353';
+    const r = dino.rect();
+    const baseY = r.y;
+    const jumping = !dino.onGround;
+
+    if (dino.ducking) {
+      px(r.x, baseY + 6, r.w, r.h - 6, fg);          // 몸통
+      px(r.x + r.w - 14, baseY, 14, 14, fg);          // 머리
+      px(r.x + r.w - 4, baseY + 4, 6, 3, fg);         // 주둥이
+      // 다리 (숙인 자세)
+      const leg = Math.floor(dino.duckFrame) % 2 === 0;
+      px(r.x + 8, baseY + r.h - 6, 10, 6, fg);
+      px(r.x + (leg ? 22 : 28), baseY + r.h - 6, 10, 6, fg);
+      return;
+    }
+
+    // 몸통
+    px(r.x, baseY + 14, 26, 26, fg);
+    // 목/머리
+    px(r.x + 20, baseY + 4, 18, 18, fg);
+    // 주둥이
+    px(r.x + r.w - 2, baseY + 10, 8, 5, fg);
+    // 눈
+    px(r.x + r.w - 8, baseY + 8, 3, 3, night ? '#1a1a1a' : '#f7f7f7');
+    // 꼬리
+    px(r.x - 8, baseY + 16, 10, 8, fg);
+    // 팔
+    px(r.x + 24, baseY + 24, 8, 4, fg);
+
+    if (jumping) {
+      // 점프 중 다리
+      px(r.x + 4, baseY + 40, 7, 7, fg);
+      px(r.x + 16, baseY + 40, 7, 7, fg);
+    } else {
+      const leg = Math.floor(dino.runFrame) % 2 === 0;
+      px(r.x + (leg ? 3 : 8), baseY + 40, 7, 7, fg);
+      px(r.x + (leg ? 15 : 20), baseY + 40, 7, 7, fg);
+    }
+  }
+
+  function drawCactus(o) {
+    const fg = night ? '#f7f7f7' : '#535353';
+    px(o.x + o.w * 0.35, o.y, o.w * 0.3, o.h, fg);
+    px(o.x, o.y + o.h * 0.3, o.w * 0.3, o.h * 0.35, fg);
+    px(o.x + o.w * 0.7, o.y + o.h * 0.2, o.w * 0.3, o.h * 0.4, fg);
+  }
+
+  function drawBird(o) {
+    const fg = night ? '#f7f7f7' : '#535353';
+    const up = Math.floor(o.frame) % 2 === 0;
+    px(o.x + 12, o.y + 12, 22, 8, fg);            // 몸통
+    px(o.x + 30, o.y + 12, 8, 8, fg);             // 머리
+    px(o.x + 36, o.y + 14, 8, 3, fg);             // 부리
+    px(o.x + 30, o.y + 12, 3, 3, night ? '#1a1a1a' : '#f7f7f7');
+    if (up) { px(o.x + 6, o.y, 16, 8, fg); px(o.x + 22, o.y + 2, 14, 6, fg); }
+    else { px(o.x + 6, o.y + 18, 16, 8, fg); px(o.x + 22, o.y + 16, 14, 6, fg); }
+  }
+
+  function drawGround() {
+    const fg = night ? '#f7f7f7' : '#535353';
+    px(0, GROUND_Y, VW, 2, fg);
+    for (let i = -1; i < VW / 40 + 1; i++) {
+      const x = i * 40 - groundOffset;
+      if ((i % 2 === 0)) px(x, GROUND_Y + 5, 8, 2, fg);
+      if ((i % 3 === 0)) px(x + 15, GROUND_Y + 10, 5, 2, fg);
+    }
+  }
+
+  function drawCloud(c) {
+    ctx.globalAlpha = 0.5;
+    const col = night ? '#ffffff' : '#8d8d8d';
+    px(c.x, c.y, 34 * c.s, 8 * c.s, col);
+    px(c.x + 8 * c.s, c.y - 6 * c.s, 18 * c.s, 8 * c.s, col);
+  }
+
+  function draw() {
+    const bg = night ? '#1a1a1a' : '#f7f7f7';
+    ctx.fillStyle = bg; ctx.fillRect(0, 0, VW, VH);
+
+    if (night) {
+      ctx.fillStyle = '#e8e8e8';
+      for (const s of stars) ctx.fillRect(s.x, s.y, s.r * 2, s.r * 2);
+      // 달
+      ctx.beginPath(); ctx.arc(700, 50, 16, 0, Math.PI * 2); ctx.fillStyle = '#f0f0f0'; ctx.fill();
+      ctx.beginPath(); ctx.arc(694, 46, 14, 0, Math.PI * 2); ctx.fillStyle = bg; ctx.fill();
+    }
+
+    for (const c of clouds) drawCloud(c);
+    ctx.globalAlpha = 1;
+
+    drawGround();
+    for (const o of obstacles) (o.type === 'bird' ? drawBird : drawCactus)(o);
+    drawDino();
+
+    // 점수
+    const fg = night ? '#f7f7f7' : '#535353';
+    ctx.font = 'bold 16px Consolas, monospace';
+    ctx.textAlign = 'right';
+    ctx.fillStyle = flashTimer > 0 ? '#d81b60' : fg;
+    if (flashTimer > 0 && Math.floor(worldTime * 10) % 2 === 0) ctx.fillStyle = fg;
+    ctx.fillText('HI ' + String(highScore).padStart(5, '0') + '   ' + String(score).padStart(5, '0'), VW - 16, 30);
+
+    // 100점 달성 점멸
+    if (flashTimer > 0) { px(VW - 46, 22, 6, 6, '#d81b60'); }
+    ctx.textAlign = 'left';
+
+    // 안내 / 게임오버
+    if (state === 'ready') {
+      ctx.fillStyle = fg; ctx.textAlign = 'center';
+      ctx.font = 'bold 20px Consolas, monospace';
+      ctx.fillText('준비 완료!  탭 또는 스페이스로 시작', VW / 2, 100);
+      ctx.font = '14px Consolas, monospace';
+      ctx.fillText('장애물을 점프로 피하세요', VW / 2, 128);
+      ctx.textAlign = 'left';
+    }
+    if (state === 'over') {
+      ctx.fillStyle = fg; ctx.textAlign = 'center';
+      ctx.font = 'bold 26px Consolas, monospace';
+      ctx.fillText('GAME OVER', VW / 2, 95);
+      ctx.font = 'bold 16px Consolas, monospace';
+      ctx.fillText('점수 ' + score + '   최고 ' + highScore, VW / 2, 122);
+      ctx.font = '14px Consolas, monospace';
+      ctx.fillText('탭 또는 스페이스로 다시 시작', VW / 2, 148);
+      ctx.textAlign = 'left';
+    }
+  }
+
+  // ── 메인 루프 ──
+  function loop(t) {
+    if (!lastTime) lastTime = t;
+    let dt = (t - lastTime) / 1000;
+    lastTime = t;
+    dt = Math.min(dt, 0.05);
+    update(dt);
+    draw();
+    requestAnimationFrame(loop);
+  }
+
+  // ── 입력 ──
+  function primaryAction() {
+    if (state === 'ready') { reset(); return; }
+    if (state === 'over') {
+      if (performance.now() - overAt > 500) reset();
+      return;
+    }
+    dino.jump();
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.code === 'Space' || e.code === 'ArrowUp' || e.code === 'KeyW') { e.preventDefault(); primaryAction(); }
+    if (e.code === 'ArrowDown' || e.code === 'KeyS') { e.preventDefault(); dino.setDuck(true); }
+  });
+  window.addEventListener('keyup', (e) => {
+    if (e.code === 'ArrowDown' || e.code === 'KeyS') dino.setDuck(false);
+  });
+
+  canvas.addEventListener('pointerdown', (e) => { e.preventDefault(); primaryAction(); });
+  const duckBtn = document.getElementById('duck-btn');
+  duckBtn.addEventListener('pointerdown', (e) => { e.preventDefault(); dino.setDuck(true); });
+  duckBtn.addEventListener('pointerup', (e) => { e.preventDefault(); dino.setDuck(false); });
+  duckBtn.addEventListener('pointercancel', () => dino.setDuck(false));
+  duckBtn.addEventListener('pointerleave', () => dino.setDuck(false));
+
+  // 화면 회전 (세로로 들고 가로처럼)
+  let rotated = false;
+  function toggleRotate() {
+    rotated = !rotated;
+    const wrap = document.getElementById('wrap');
+    canvas.classList.toggle('rotated', rotated);
+    if (rotated) {
+      wrap.style.position = 'fixed';
+      wrap.style.left = '50%'; wrap.style.top = '50%';
+      wrap.style.width = '100vh'; wrap.style.maxWidth = 'none';
+      wrap.style.transform = 'translate(-50%, -50%) rotate(90deg)';
+      wrap.style.zIndex = '4';
+    } else {
+      wrap.removeAttribute('style');
+    }
+  }
+  document.getElementById('rotate-btn').addEventListener('click', toggleRotate);
+  document.getElementById('restart-btn').addEventListener('click', () => reset());
+
+  // 시작
+  dino.reset();
+  for (let i = 0; i < 4; i++) spawnCloud(Math.random() * VW);
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
